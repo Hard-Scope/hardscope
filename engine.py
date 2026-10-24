@@ -14,8 +14,9 @@ import os
 import re
 import sys
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Sequence
+from typing import Any, Dict, Iterable, List, Sequence, Tuple
 from urllib.parse import urlparse
 
 try:
@@ -24,6 +25,12 @@ except ImportError as exc:  # pragma: no cover
     raise SystemExit(
         "The 'openai' Python package is required. Install it with: pip install openai"
     ) from exc
+
+
+DEFAULT_TIMEOUT_SECONDS = 300.0
+DEFAULT_MAX_TOKENS = 4096
+FUZZY_MATCH_THRESHOLD = 0.8
+_EDGE_PUNCTUATION = ".,;:!?()[]{}\"'`*_"
 
 
 @dataclass(frozen=True)
@@ -59,7 +66,7 @@ RULE_REGISTRY: Sequence[RuleDefinition] = (
     RuleDefinition(
         rule_id="UNBOUNDED_SCOPE",
         severity="medium",
-        target="Permissive or open-ended qualifiers like 'etc.', 'and similar topics', 'as you see fit', or 'generally minimize'.",
+        target="Permissive or open-ended qualifiers like 'etc.', 'and similar topics', 'as you see fit', 'generally minimize', 'everything else', 'at regular intervals', or catch-all targets with no fixed list.",
         vulnerability="These soft linguistic filters expand the agent's operational domain dynamically, making it vulnerable to instruction drift when handling adversarial user inputs.",
         recommendation="Replace open-ended qualifiers with precise boundaries and fixed enumerations, such as: 'Only operate on the listed files and approved domains; do not infer additional categories or act outside the enumerated scope.'",
         requires_human_review=False,
@@ -148,13 +155,22 @@ def normalize_api_base(api_base: str | None) -> str | None:
     return base
 
 
-def create_openai_client(api_key: str | None, api_base: str | None) -> OpenAI:
+def create_openai_client(
+    api_key: str | None,
+    api_base: str | None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+) -> OpenAI:
     resolved_key = api_key or os.getenv("HARDSCOPE_API_KEY")
     if not resolved_key:
         raise RuntimeError("Missing API key. Set HARDSCOPE_API_KEY or pass --api-key.")
 
     resolved_base = normalize_api_base(api_base or os.getenv("HARDSCOPE_API_BASE"))
-    client_kwargs: Dict[str, Any] = {"api_key": resolved_key}
+    # max_retries=0: fail fast instead of silently retrying a stalled request.
+    client_kwargs: Dict[str, Any] = {
+        "api_key": resolved_key,
+        "timeout": timeout,
+        "max_retries": 0,
+    }
     if resolved_base:
         client_kwargs["base_url"] = resolved_base
     return OpenAI(**client_kwargs)
@@ -241,18 +257,41 @@ def parse_model_response(raw_response: str) -> List[Dict[str, Any]]:
     return normalized
 
 
-def build_prompt(file_name: str, file_text: str, rules: RuleRegistry) -> str:
+def build_prompt(file_name: str, file_text: str, rules: RuleRegistry, no_think: bool = False) -> str:
     rule_summary = rules.describe()
 
-    return (
+    prompt = (
         "You are HardScope, a static security linter for AI instructions and prompts. "
         "Evaluate the provided Markdown text for security issues.\n\n"
         "Rules registry:\n"
         f"{rule_summary}\n\n"
         "Return ONLY a valid JSON object with a single key 'findings' whose value is an array "
         "of finding objects. Use zero markdown fences and no extra commentary.\n"
-        "Each finding must conform exactly to the schema below and include only literal source evidence.\n"
-        "The 'evidence' field must be the exact, verbatim phrase or slice of text found in the source Markdown.\n"
+        "Each finding must conform exactly to the schema below.\n\n"
+        "Coverage: read the source one instruction at a time (every sentence, numbered item, and bullet) "
+        "and check each one against EVERY rule in the registry. Do not stop after the first rule that matches. "
+        "Report every instruction that violates a rule, even if it looks similar to an earlier finding.\n\n"
+        "Field requirements:\n"
+        "- 'evidence': copy the exact, verbatim text from the source Markdown, character for character, "
+        "preserving capitalization, punctuation, and spacing. Do not paraphrase, reorder, or add words. "
+        "Quote the COMPLETE instruction that is risky, including any leading or trailing condition "
+        "(for example an 'if ...', 'when ...', 'as needed', or 'looks like ...' clause), not just the verb.\n"
+        "- 'finding': one sentence that describes THIS specific problem in the evidence. "
+        "Do not reuse the same wording across findings.\n"
+        "- 'possible_failure': a concrete failure that could result from THIS evidence.\n"
+        "- 'missing_constraints': the specific guards missing for THIS evidence. Keep them proportionate "
+        "to the risk and do not demand heavyweight controls (such as multi-factor authorization) for minor actions.\n"
+        "- 'recommendation': a fix tailored to THIS evidence, rewriting or constraining the specific "
+        "instruction. Do NOT copy the registry recommendation verbatim. Do NOT invent concrete values that "
+        "are not in the source (no made-up file extensions, age thresholds, sizes, retention periods, paths, "
+        "or names). Use clearly marked placeholders such as <ALLOWED_PATTERN>, <MAX_AGE_DAYS>, or <APPROVED_PATH> "
+        "that the author must fill in, and preserve the original intent of the instruction.\n"
+        "- 'confidence': your honest certainty from 0.0 to 1.0. Use lower values for borderline cases "
+        "and do not give every finding the same value.\n"
+        "- If one phrase fits two rules, report it once under the single best-fitting rule. "
+        "Open-ended wording such as 'everything else', 'etc.', 'as needed', 'at regular intervals', or "
+        "'keep it lean' belongs under UNBOUNDED_SCOPE unless the same text is a destructive verb with "
+        "a vague trigger, which belongs under AMBIGUOUS_DESTRUCTIVE_ACTION.\n"
         "Use 'location' only as a field computed during post-processing; do not invent or include it in your raw response.\n"
         "Do not return conversational explanations.\n"
         'If no findings are present, return {"findings":[]}\n\n'
@@ -263,29 +302,97 @@ def build_prompt(file_name: str, file_text: str, rules: RuleRegistry) -> str:
         "---END SOURCE---\n\n"
         "Required response schema:\n"
         + json.dumps(FINDING_SCHEMA, separators=(",", ":"), ensure_ascii=False)
-        + "\n\n/no_think"
     )
+    if no_think:
+        prompt += "\n\n/no_think"
+    return prompt
+
+
+def _locate_fuzzy(raw_text: str, evidence: str) -> Tuple[int, int]:
+    """Best-effort fuzzy search for evidence the model altered slightly."""
+    words = evidence.split()
+    tokens = [(m.start(), m.end(), m.group()) for m in re.finditer(r"\S+", raw_text)]
+    if not words or not tokens:
+        return -1, -1
+
+    target = " ".join(words).lower()
+    key_words = {w.lower().strip(_EDGE_PUNCTUATION) for w in words if len(w) > 3}
+    key_words.discard("")
+
+    best_ratio, best_start, best_end = 0.0, -1, -1
+    count = len(words)
+    for size in sorted({max(1, count - 1), count, count + 1}):
+        if size > len(tokens):
+            continue
+        for i in range(len(tokens) - size + 1):
+            window = tokens[i : i + size]
+            # Cheap prefilter: the window must share at least one longer word.
+            if key_words and not any(t[2].lower().strip(_EDGE_PUNCTUATION) in key_words for t in window):
+                continue
+            candidate = " ".join(t[2] for t in window).lower()
+            ratio = SequenceMatcher(None, target, candidate).ratio()
+            if ratio > best_ratio:
+                best_ratio, best_start, best_end = ratio, window[0][0], window[-1][1]
+
+    if best_ratio >= FUZZY_MATCH_THRESHOLD:
+        return best_start, best_end
+    return -1, -1
+
+
+def locate_evidence(raw_text: str, evidence: Any) -> Tuple[int, int, str]:
+    """Find evidence in the source. Returns (start, end, match_type).
+
+    match_type is one of: exact, normalized, fuzzy, none.
+    """
+    if not isinstance(evidence, str) or not evidence.strip():
+        return -1, -1, "none"
+
+    evidence = evidence.strip()
+
+    index = raw_text.find(evidence)
+    if index >= 0:
+        return index, index + len(evidence), "exact"
+
+    # Same words, but whitespace/newlines/case differ.
+    pattern = r"\s+".join(re.escape(word) for word in evidence.split())
+    match = re.search(pattern, raw_text, flags=re.IGNORECASE)
+    if match:
+        return match.start(), match.end(), "normalized"
+
+    start, end = _locate_fuzzy(raw_text, evidence)
+    if start >= 0:
+        return start, end, "fuzzy"
+
+    return -1, -1, "none"
 
 
 def enrich_with_locations(raw_file_text: str, file_name: str, findings: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     enriched: List[Dict[str, Any]] = []
     for finding in findings:
-        evidence = finding.get("evidence")
-        start_index = raw_file_text.find(evidence) if isinstance(evidence, str) and evidence else -1
-        location = {
+        start, end, match_type = locate_evidence(raw_file_text, finding.get("evidence"))
+        finding["location"] = {
             "file": file_name,
-            "start_char": start_index if start_index >= 0 else -1,
-            "end_char": start_index + len(evidence) if start_index >= 0 else -1,
+            "start_char": start,
+            "end_char": end,
+            "match": match_type,
         }
-        finding["location"] = location
         enriched.append(finding)
     return enriched
 
 
-def call_model_for_file(client: OpenAI, model: str, file_name: str, raw_text: str, registry: RuleRegistry) -> List[Dict[str, Any]]:
+def call_model_for_file(
+    client: OpenAI,
+    model: str,
+    file_name: str,
+    raw_text: str,
+    registry: RuleRegistry,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> List[Dict[str, Any]]:
+    # "/no_think" is a Qwen3 directive; only send it to models that understand it.
+    no_think = "qwen3" in model.lower()
     messages = [
         {"role": "system", "content": "You are HardScope. Return only valid JSON. No explanatory text."},
-        {"role": "user", "content": build_prompt(file_name, raw_text, registry)},
+        {"role": "user", "content": build_prompt(file_name, raw_text, registry, no_think=no_think)},
     ]
 
     try:
@@ -293,6 +400,7 @@ def call_model_for_file(client: OpenAI, model: str, file_name: str, raw_text: st
             model=model,
             messages=messages,
             temperature=0.0,
+            max_tokens=max_tokens,
             response_format={
                 "type": "json_schema",
                 "json_schema": {
@@ -314,34 +422,56 @@ def call_model_for_file(client: OpenAI, model: str, file_name: str, raw_text: st
             model=model,
             messages=messages,
             temperature=0.0,
+            max_tokens=max_tokens,
             response_format={"type": "json_object"},
         )
 
     if not hasattr(completion, "choices") or not completion.choices:
         raise ValidationError("No choices returned from the model endpoint.")
 
-    content = completion.choices[0].message.content
+    choice = completion.choices[0]
+    content = choice.message.content
     if content is None:
         raise ValidationError("The model returned an empty response.")
+
+    if getattr(choice, "finish_reason", None) == "length":
+        raise ValidationError(
+            f"The model hit the {max_tokens}-token limit before finishing, so the JSON is incomplete. "
+            "Raise --max-tokens, use a smaller input file, or use a model that thinks less."
+        )
 
     return parse_model_response(content)
 
 
-def analyze_file(target_path: Path, model: str, client: OpenAI, registry: RuleRegistry) -> List[Dict[str, Any]]:
+def analyze_file(
+    target_path: Path,
+    model: str,
+    client: OpenAI,
+    registry: RuleRegistry,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> List[Dict[str, Any]]:
+    print(f"Analyzing {target_path.name} with {model} (this can take a while)...", file=sys.stderr)
     raw_text = read_text_file(target_path)
-    findings = call_model_for_file(client, model, target_path.name, raw_text, registry)
+    findings = call_model_for_file(client, model, target_path.name, raw_text, registry, max_tokens)
     return enrich_with_locations(raw_text, target_path.name, findings)
 
 
-def analyze_target(target: str, model: str, api_key: str | None, api_base: str | None) -> List[Dict[str, Any]]:
+def analyze_target(
+    target: str,
+    model: str,
+    api_key: str | None,
+    api_base: str | None,
+    timeout: float = DEFAULT_TIMEOUT_SECONDS,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
+) -> List[Dict[str, Any]]:
     registry = RuleRegistry()
-    client = create_openai_client(api_key, api_base)
+    client = create_openai_client(api_key, api_base, timeout)
 
     findings: List[Dict[str, Any]] = []
     for file_path in list_markdown_files(target):
         if not file_path.is_file():
             continue
-        findings.extend(analyze_file(file_path, model, client, registry))
+        findings.extend(analyze_file(file_path, model, client, registry, max_tokens))
 
     return findings
 
@@ -360,6 +490,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default=os.getenv("HARDSCOPE_MODEL", "qwen/qwen3-8b"), help="OpenAI-compatible model name (for Ollama, e.g. qwen3:8b).")
     parser.add_argument("--api-key", default=os.getenv("HARDSCOPE_API_KEY"), help="API key for the OpenAI-compatible endpoint.")
     parser.add_argument("--api-base", default=os.getenv("HARDSCOPE_API_BASE"), help="Base URL for the OpenAI-compatible API (e.g. http://127.0.0.1:11434/v1).")
+    parser.add_argument("--timeout", type=float, default=DEFAULT_TIMEOUT_SECONDS, help="Seconds to wait for each model response before failing (default: %(default)s).")
+    parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS, help="Maximum tokens the model may generate per file (default: %(default)s).")
     return parser
 
 
@@ -368,10 +500,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        findings = analyze_target(args.target, args.model, args.api_key, args.api_base)
+        findings = analyze_target(
+            args.target,
+            args.model,
+            args.api_key,
+            args.api_base,
+            timeout=args.timeout,
+            max_tokens=args.max_tokens,
+        )
         output_file = save_report(findings, args.output)
+        unlocated = sum(1 for f in findings if f.get("location", {}).get("start_char", -1) < 0)
         print(f"HardScope report saved to: {output_file}")
         print(f"Findings: {len(findings)}")
+        if unlocated:
+            print(f"Findings without a source location: {unlocated}")
         return 0
     except Exception as exc:  # pragma: no cover - CLI boundary
         print(f"HardScope error: {exc}", file=sys.stderr)
