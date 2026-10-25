@@ -11,7 +11,7 @@ It scans Markdown files, sends them to an OpenAI-compatible model, and identifie
 ## Installation
 
 ```bash
-pip install git+https://github.com/<your-username>/Hard-Scope-CLI.git
+pip install git+https://github.com/Hard-Scope/hardscope.git
 ```
 
 ## Usage
