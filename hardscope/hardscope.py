@@ -449,12 +449,14 @@ def analyze_file(
     client: OpenAI,
     registry: RuleRegistry,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    file_name: str | None = None,
 ) -> List[Dict[str, Any]]:
     print(f"Analyzing {target_path.name} with {model} (this can take a while)...", file=sys.stderr)
+    display_name = file_name or target_path.name
     raw_text = read_text_file(target_path)
-    findings = call_model_for_file(client, model, target_path.name, raw_text, registry, max_tokens)
+    findings = call_model_for_file(client, model, display_name, raw_text, registry, max_tokens)
     findings = registry.enforce(findings)
-    return enrich_with_locations(raw_text, target_path.name, findings)
+    return enrich_with_locations(raw_text, display_name, findings)
 
 
 def analyze_target(
@@ -467,12 +469,15 @@ def analyze_target(
 ) -> List[Dict[str, Any]]:
     registry = RuleRegistry()
     client = create_openai_client(api_key, api_base, timeout)
+    target_path = Path(target).expanduser()
+    is_directory = target_path.is_dir()
 
     findings: List[Dict[str, Any]] = []
-    for file_path in list_markdown_files(target):
+    for file_path in list_markdown_files(target_path):
         if not file_path.is_file():
             continue
-        findings.extend(analyze_file(file_path, model, client, registry, max_tokens))
+        file_name = file_path.relative_to(target_path).as_posix() if is_directory else file_path.name
+        findings.extend(analyze_file(file_path, model, client, registry, max_tokens, file_name))
 
     return findings
 
