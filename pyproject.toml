@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hardscope"
+version = "0.1.0"
+description = "HardScope static security analysis for AI instructions and agent prompts"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "openai>=1.0.0",
+]
+
+[project.scripts]
+hardscope = "hardscope.cli:main"
+
+[tool.setuptools]
+packages = ["hardscope"]

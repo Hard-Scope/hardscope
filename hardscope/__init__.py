@@ -1,0 +1,41 @@
+"""HardScope package."""
+
+from .hardscope import (
+    DEFAULT_MAX_TOKENS,
+    DEFAULT_TIMEOUT_SECONDS,
+    FINDING_SCHEMA,
+    RULE_REGISTRY,
+    RuleDefinition,
+    RuleRegistry,
+    ValidationError,
+    analyze_file,
+    analyze_target,
+    build_prompt,
+    create_openai_client,
+    enrich_with_locations,
+    list_markdown_files,
+    locate_evidence,
+    parse_model_response,
+    read_text_file,
+    save_report,
+)
+
+__all__ = [
+    "DEFAULT_MAX_TOKENS",
+    "DEFAULT_TIMEOUT_SECONDS",
+    "FINDING_SCHEMA",
+    "RULE_REGISTRY",
+    "RuleDefinition",
+    "RuleRegistry",
+    "ValidationError",
+    "analyze_file",
+    "analyze_target",
+    "build_prompt",
+    "create_openai_client",
+    "enrich_with_locations",
+    "list_markdown_files",
+    "locate_evidence",
+    "parse_model_response",
+    "read_text_file",
+    "save_report",
+]
